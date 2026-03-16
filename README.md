@@ -1,4 +1,4 @@
-# GSoC 2026 — kornia-slam: Robust Visual-Inertial SLAM  
+# GSoC 2026 Draft Proposal — kornia-slam: Robust Visual-Inertial SLAM  
 **Author:** Arkin Kansra ([@arc-wonders](https://github.com/arc-wonders))  
 **Organization:** Kornia  
 
