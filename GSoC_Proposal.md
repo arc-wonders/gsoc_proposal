@@ -94,22 +94,22 @@ These are not hypothetical. EuRoC `V203` (aggressive motion + poor lighting), TU
 kornia-rs provides a comprehensive set of vision primitives. Understanding what is already implemented is critical to avoiding redundant work:
 
 **Feature Extraction (kornia-imgproc):**
-- `OrbDetector`: 8-level scale pyramid (1.2x downscale), two-tier FAST thresholds (20/255 initial, 7/255 fallback), Harris response scoring, grid-based spatial distribution (35px cells), 256-bit binary descriptors with orientation assignment. Default: 500 keypoints.
+- `OrbDetector`: 8-level scale pyramid (1.2x downscale), two-tier FAST thresholds (20/255 initial, 7/255 fallback), Harris response scoring, octree-based spatial distribution (35px cell size for detection), 256-bit binary descriptors with orientation assignment. Default: 500 keypoints.
 - `match_orb_descriptors`: ORB-SLAM3-style matching with `nn_ratio=0.6`, `th_low=50` Hamming threshold, and orientation histogram consistency check (30 bins, 3-maxima filtering).
 - `match_descriptors`: Generic brute-force Hamming matching with cross-check and Lowe's ratio test.
 
 **Pose Estimation (kornia-3d):**
-- `estimate_two_view_pose`: Full pipeline - RANSAC fundamental (8pt, 2000 iterations, 1px threshold) + RANSAC homography → model selection (Mur-Artal heuristic: H wins if `score_H / (score_H + score_F) > 0.8`) → essential decomposition → cheirality-checked triangulation.
+- `two_view_estimate`: Full pipeline - RANSAC fundamental (8pt, 2000 iterations, 1px threshold) + RANSAC homography → model selection (homography preferred when `inlier_count_H > 0.8 * inlier_count_F`) → essential decomposition → cheirality-checked triangulation.
 - `triangulate_point_linear`: DLT triangulation with depth and parallax validation.
 - EPnP solver with barycentric coordinates, multi-beta null-space estimation, optional LM refinement. RANSAC wrapper: 100 iterations, 8px threshold, adaptive iteration count, early stop at 95% inlier ratio, optional refit on all inliers.
 
 **Optimization (kornia-algebra):**
 - `LevenbergMarquardt`: Generic optimizer with `Problem`/`Factor`/`Variable` architecture. Supports SE3, SO3, SE2, SO2 variable types via `VariableType::plus()` manifold retraction. Lambda adaptation (init: 1e-3, max: 1e10, factor: 10x). Cost/gradient convergence checks. Callback support.
-- `ReprojectionFactor`: SE3 pose parameterization `[qw, qx, qy, qz, tx, ty, tz]`, analytical Jacobians, distortion support (Brown-Conrady polynomial).
+- `ReprojectionFactor`: SE3 pose parameterization `[qw, qx, qy, qz, tx, ty, tz]`, numerical Jacobians (central differences), distortion support (Brown-Conrady polynomial).
 - Robust losses: `IdentityLoss`, `HuberLoss`, `CauchyLoss` - each with `weight()` and `rho()` methods for IRLS-style optimization.
 
 **Place Recognition (kornia-bow):**
-- Hierarchical vocabulary tree with variable branching factor. Direct index for feature-to-word mapping. L1 similarity scoring. 6 distance metrics. Bincode serialization.
+- Hierarchical vocabulary tree with variable branching factor. Direct index for feature-to-word mapping. 6 BoW scoring methods (L1, L2, chi-square, KL divergence, Bhattacharyya, dot product). Bincode serialization.
 
 **Lie Groups (kornia-algebra):**
 - SE3F32: `exp`/`log`, `retract`, `left_jacobian`/`right_jacobian`, `adjoint`, `inverse`. Full tangent-space operations.
@@ -125,12 +125,12 @@ The kornia-slam repository's `develop` branch already contains a working visual 
 
 Analysis of the develop branch (27 commits, 4 core modules + example pipeline) shows that the current system already implements:
 
-- **State machine:** `Bootstrap` → `Tracking` (two states; no explicit LOST state - after 15 consecutive failures, the system resets to Bootstrap and **discards the map**)
+- **State machine:** `Bootstrap` → `Tracking` (two states; no explicit LOST state - after 15 consecutive failures, the system resets to Bootstrap while the map object persists but is effectively abandoned)
 - **Motion model:** Constant velocity prediction via `state.velocity` - the predicted pose is already used as the PnP initial guess
 - **Tracking pipeline:** Projection-guided matching → PnP with LM refinement → local map refinement, implemented in `MapProjectionEstimator`
 - **Guided matching:** Already implemented via map point projection + `KeypointGrid` spatial index (`query_radius()` with `search_radius=15px`, `max_hamming=50`), including a narrow-to-wide fallback (doubles radius if <20 matches), with descriptor matching fallback against the reference keyframe
 - **Map point management:** `MapPoint` tracks `n_visible`, `n_found`, and `found_ratio()`. `Map::cull()` removes points with `found_ratio < 0.20` after 5 observations, plus behind-camera culling
-- **Local bundle adjustment:** `Map::optimize()` runs on the last ~3 keyframes using `kornia_3d::ba::bundle_adjust` with analytical Jacobians, fixing older keyframes as anchors
+- **Local bundle adjustment:** `Map::optimize()` runs on the last ~3 keyframes using `kornia_3d::ba::bundle_adjust`, fixing older keyframes as anchors
 - **Keyframe insertion:** `KeyframePolicy` based on frame gap (`min=3`, `max=8`) and inlier ratio threshold (`ref_ratio=0.6`)
 - **Map triangulation:** New map points are grown from keyframe pairs via two-view estimation + `triangulate_matched_points`
 - **Local map selection:** `build_local_map_points()` uses covisibility voting + recent keyframe neighborhood
@@ -146,7 +146,7 @@ Despite having a functional pipeline, several key robustness features are missin
 | **No preprocessing** | Raw images → ORB directly | Feature starvation in mixed lighting, descriptor corruption under motion blur |
 | **No adaptive feature extraction** | Fixed FAST thresholds (global two-tier) | Poor spatial coverage in low-contrast regions |
 | **No statistical outlier rejection** | Only RANSAC + reprojection threshold filtering | Bad correspondences from dynamic objects persist in the map |
-| **No relocalization** | 15 failures → reset to Bootstrap, **map discarded** | Complete loss of mapping progress on any tracking interruption |
+| **No relocalization** | 15 failures → reset to Bootstrap (map abandoned, bootstrap restarts from scratch) | Effective loss of mapping progress on any tracking interruption |
 | **No explicit LOST state** | Binary Bootstrap/Tracking | No opportunity to attempt recovery before destroying the map |
 | **No redundant keyframe culling** | Keyframes accumulate indefinitely | Memory growth, BA slowdown in long sessions |
 | **No adaptive parameter tuning** | All thresholds are compile-time constants | Silent degradation when conditions change mid-session |
@@ -154,7 +154,7 @@ Despite having a functional pipeline, several key robustness features are missin
 
 ### 4.3 Bubbaloop - Mature Runtime
 
-Bubbaloop provides the deployment target: Zenoh pub/sub data plane, Node SDK (50-line pattern for self-describing nodes with schema/manifest/health/config/command queryables), MCP server (49 tools, 3-tier RBAC), multi-agent runtime with 4-tier memory (world state → short-term → episodic → semantic), and a React dashboard. Topics follow `bubbaloop/{scope}/{machine_id}/{node_name}/{subtopic}`. The node SDK handles Zenoh session management, health heartbeats (5s interval), and schema registration automatically.
+Bubbaloop provides the deployment target: Zenoh pub/sub data plane, Node SDK (~80-line template for self-describing nodes with automatic schema and health queryables, plus conventions for manifest/config/command), MCP server (40+ tools, 3-tier RBAC), multi-agent runtime with 4-tier memory (world state → short-term → episodic → semantic), and a React dashboard. Topics follow `bubbaloop/{scope}/{machine_id}/...` with node-specific subtopic hierarchies. The node SDK handles Zenoh session management, health heartbeats (5s interval), and schema registration automatically.
 
 ---
 
@@ -305,7 +305,7 @@ The first keyframe (origin) and the two most recent keyframes are never culled.
 
 ### 5.4 Failure Recovery
 
-**Problem:** When tracking fails, the current pipeline increments `consecutive_failures` and after 15 failures calls `state.reset()`, which transitions back to `Bootstrap` mode and **discards the entire map**. There is no LOST state, no relocalization attempt, and no way to recover the mapping progress. A momentary occlusion or fast head turn destroys minutes of accumulated mapping work.
+**Problem:** When tracking fails, the current pipeline increments `consecutive_failures` and after 15 failures calls `state.reset()`, which transitions back to `Bootstrap` mode. While the `Map` object is not explicitly cleared, the system restarts bootstrapping from scratch with no mechanism to reconnect to the existing map. There is no LOST state, no relocalization attempt, and no way to recover the mapping progress. A momentary occlusion or fast head turn effectively abandons minutes of accumulated mapping work.
 
 **Fix A - Tracking Loss Detection and LOST State:**
 
