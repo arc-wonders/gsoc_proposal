@@ -1,10 +1,45 @@
 # GSoC Proposal: Improving Robustness of Kornia-SLAM for Real-World Visual-Inertial Deployment with Bubbaloop Integration
 
-**Organization:** Kornia
-**Project Size:** Large (~350 hours)
-**Difficulty:** Hard
+**Organization:** Kornia  
+**Project Size:** Large (~350 hours)  
+**Difficulty:** Hard  
 
 ---
+
+## Executive Summary
+
+This project focuses on transforming kornia-slam from a working visual odometry pipeline into a **robust, real-world deployable SLAM system**.
+
+Instead of introducing new algorithms, the project targets the primary gap in modern SLAM systems: **failure under real-world conditions** such as motion blur, lighting changes, dynamic objects, and tracking loss.
+
+The core contributions are:
+
+1. **Robust tracking pipeline**
+   - Adaptive preprocessing (CLAHE, blur detection)
+   - Improved matching and outlier rejection
+   - Dynamic parameter tuning
+
+2. **Failure recovery system**
+   - Explicit LOST state
+   - BoW-based relocalization
+   - Seamless recovery without map reset
+
+3. **Adaptive runtime monitoring**
+   - Real-time health metrics
+   - Automatic parameter adjustment
+
+4. **Real-world deployment via Bubbaloop**
+   - SLAM node with live pose streaming
+   - MCP-based spatial querying
+   - Autonomous indoor mapping agent
+
+The system will be evaluated on TUM, EuRoC, and TUM-VI datasets with measurable improvements in tracking success, relocalization, and robustness.
+
+---
+
+## System Overview
+![Alt text](images\system_overview.png)
+
 
 ## Table of Contents
 
@@ -31,24 +66,30 @@
 
 ## 1. Introduction
 
-kornia-slam is building a Rust-native visual-inertial SLAM pipeline on top of kornia-rs's extensive vision primitives: ORB feature detection, EPnP pose estimation with RANSAC, a Levenberg-Marquardt optimizer with SE(3) manifold support, DLT triangulation, and Bag-of-Words place recognition. The develop branch already contains a working visual odometry pipeline with mapping and bundle adjustment, and IMU preintegration is being added by the maintainer independently.
+kornia-slam is a Rust-native visual-inertial SLAM system built on top of kornia-rs, providing a complete pipeline including feature extraction, pose estimation, mapping, and bundle adjustment. The develop branch already contains a functional visual odometry system, with IMU preintegration actively being added.
 
 **The problem is not that the pipeline doesn't exist. The problem is that it will break in the real world.**
 
-Every visual SLAM system faces the same gap: the core algorithms work on clean benchmark frames but fail under lighting changes, motion blur, dynamic objects, repetitive textures, and tracking loss. Bridging this gap , turning a working pipeline into a *reliable* one  is what separates a research prototype from deployable software. As the SLAM Handbook emphasizes, robustness engineering is where the majority of effort should be spent in any production SLAM system.
+Modern SLAM systems consistently face the same gap: algorithms that work reliably on clean benchmarks degrade under real-world conditions such as lighting variation, motion blur, dynamic scenes, repetitive textures, and tracking loss. Bridging this gap—turning a working pipeline into a *reliable system*—is what separates research prototypes from deployable software. As emphasized in SLAM literature, robustness engineering is where the majority of effort lies in production systems.
 
-This proposal focuses entirely on that robustness gap. **The core deliverables are Sections 5.1–5.4** (preprocessing, tracking, keyframe management, failure recovery). **Sections 5.5 and 5.7 are stretch goals** depending on progress - they add value but the project succeeds without them.
+This proposal focuses entirely on that robustness gap.  
+**The core deliverables are Sections 5.1–5.4** (preprocessing, tracking, keyframe management, and failure recovery), while **Sections 5.5 and 5.7 are stretch goals**.
 
-The deliverables are:
+The project will deliver:
 
-1. **Robustness modules** for kornia-slam: adaptive preprocessing, guided matching, outlier rejection, keyframe management, relocalization, and failure recovery - each targeting a specific real-world failure mode.
-2. **Adaptive runtime monitoring**: a lightweight, rule-based system that detects degraded subsystem performance (e.g., poor feature matching, high BA residuals) and adjusts pipeline parameters - switching extraction strategies, tuning thresholds, or triggering relocalization without human intervention. This design is compatible with future agent-based extensions via Bubbaloop.
-3. **A Bubbaloop application** that demonstrates the improved SLAM system in a real use case: an autonomous indoor mapping agent with MCP-based map serving, enabling AI agents to query spatial state (current pose, nearby landmarks, spatial relationships) for downstream reasoning.
-4. **Quantitative evidence** that the improvements work: published before/after benchmarks on EuRoC and TUM-VI sequences, measuring tracking success rate, relocalization speed, and drift under challenging conditions, plus a video demo of the complete system.
+1. **Robustness modules for kornia-slam**  
+   Adaptive preprocessing, improved matching, outlier rejection, keyframe management, and relocalization—each targeting a specific real-world failure mode.
 
-The goal of this project is to convert kornia-slam from a functioning pipeline into a system that can sustain long, uninterrupted operation under real-world conditions.
+2. **Adaptive runtime monitoring**  
+   A lightweight, rule-based system that detects degraded performance (e.g., low inlier ratio, high BA residuals) and dynamically adjusts pipeline parameters without human intervention.
 
----
+3. **A Bubbaloop application**  
+   An autonomous indoor mapping agent demonstrating the improved SLAM system, with MCP-based map serving for querying pose, landmarks, and spatial relationships.
+
+4. **Quantitative validation**  
+   Before/after benchmarks on EuRoC and TUM-VI measuring tracking success rate, relocalization performance, and drift, along with a complete system demo.
+
+The goal is to transform kornia-slam from a functioning pipeline into a system capable of **sustained, reliable operation in real-world environments**.
 
 ## 2. About Me
 
@@ -66,98 +107,104 @@ I am a computer science student focused on computer vision, robotics perception,
 
 ## 3. Problem Statement
 
-A visual SLAM pipeline that runs tracking → mapping → bundle adjustment has a predictable set of failure modes when exposed to real cameras in real environments. These failures are not algorithmic bugs - they are robustness gaps that require deliberate engineering to address.
+A visual SLAM pipeline that performs tracking → mapping → bundle adjustment exhibits a well-defined set of failure modes when deployed in real-world environments.
+
+These failures are not algorithmic errors, but **robustness gaps**—implicit assumptions that hold on clean benchmark data but break under real conditions such as lighting variation, motion blur, dynamic objects, and ambiguous geometry. As a result, even a technically correct pipeline can degrade rapidly or fail entirely.
 
 ### Failure Mode Analysis
 
 | Failure Mode | Root Cause | Impact | Frequency |
 |---|---|---|---|
-| **Feature starvation** | Fixed FAST threshold (20/255) fails in dark regions or overexposed areas | Tracking loss - not enough 2D-3D correspondences for PnP | Every indoor scene with mixed lighting |
-| **Motion blur corruption** | Camera motion during exposure smears features, ORB descriptors become unreliable | False matches → wrong pose → map corruption | Fast head/hand motion, mobile robot turns |
-| **Brute-force matching bottleneck** | O(n²) descriptor matching without spatial priors | Slow tracking + false matches in repetitive textures (shelves, tiles, brick walls) | Structured indoor environments |
-| **Drift accumulation** | No temporal consistency between frames, each pose estimated independently | Trajectory drifts, map becomes inconsistent | Always, compounds over time |
-| **Dynamic object contamination** | Moving people/objects create map points that don't persist | Phantom map points → outlier-dominated BA → global map corruption | Any inhabited space |
-| **Tracking loss without recovery** | No relocalization mechanism - once lost, system stays lost | Complete system failure requiring manual restart | Occlusion, fast motion, scene change |
-| **Keyframe redundancy** | No culling strategy - keyframes accumulate without geometric diversity | Memory growth, BA slows as window grows | Long-running sessions |
-| **Initialization fragility** | Two-view geometry requires sufficient parallax - pure rotation or small baseline fails silently | System stuck in INITIALIZING state, never starts tracking | Tabletop cameras, slow initial movement |
+| **Feature starvation** | Fixed FAST threshold fails in low-light or overexposed regions | Tracking loss due to insufficient 2D–3D correspondences | Common in indoor scenes with mixed lighting |
+| **Motion blur corruption** | Camera motion during exposure degrades feature localization and descriptors | False matches → incorrect pose → map corruption | Fast motion (handheld, head movement, robots) |
+| **Brute-force matching bottleneck** | O(n²) descriptor matching without spatial constraints | Increased latency and incorrect matches in repetitive textures | Structured environments (corridors, shelves, tiles) |
+| **Drift accumulation** | Frame-to-frame pose estimation without strong temporal consistency | Gradual trajectory drift and map inconsistency | Always present, accumulates over time |
+| **Dynamic object contamination** | Non-static objects introduce inconsistent observations into the map | Persistent outliers → degraded bundle adjustment → map corruption | Any populated or dynamic environment |
+| **Tracking loss without recovery** | Absence of relocalization mechanism | Complete system failure requiring manual restart | Occlusion, rapid motion, scene change |
+| **Keyframe redundancy** | No redundancy-aware culling strategy | Memory growth and increasing BA cost over time | Long-running sequences |
+| **Initialization fragility** | Two-view geometry fails under low parallax or pure rotation | System remains stuck in initialization | Slow motion or constrained setups |
 
-These are not hypothetical. EuRoC `V203` (aggressive motion + poor lighting), TUM-VI `corridor` sequences (featureless walls with IMU), and TUM `fr3/nostructure_texture_near_withloop` (low texture) are standard sequences that expose exactly these failures. A robust SLAM system must handle them without human intervention.
+These failure modes are consistently observed in standard benchmarks such as EuRoC `V203` (aggressive motion and lighting variation), TUM-VI corridor sequences (low texture with IMU), and TUM `fr3/nostructure_texture_near_withloop` (texture-poor scenes).
 
-**This proposal addresses each failure mode with a specific, testable improvement.**
+A robust SLAM system must handle these conditions **without manual intervention or parameter retuning**.
+
+**This proposal addresses each failure mode with a corresponding, testable system-level improvement.**
 
 ---
 
 ## 4. Current System Understanding
 
-### 4.1 kornia-rs - What Already Exists
+### 4.1 kornia-rs — Existing Capabilities
 
-kornia-rs provides a comprehensive set of vision primitives. Understanding what is already implemented is critical to avoiding redundant work:
+kornia-rs already provides a comprehensive set of vision and optimization primitives required for building a SLAM system. These include:
 
-**Feature Extraction (kornia-imgproc):**
-- `OrbDetector`: 8-level scale pyramid (1.2x downscale), two-tier FAST thresholds (20/255 initial, 7/255 fallback), Harris response scoring, octree-based spatial distribution (35px cell size for detection), 256-bit binary descriptors with orientation assignment. Default: 500 keypoints.
-- `match_orb_descriptors`: ORB-SLAM3-style matching with `nn_ratio=0.6`, `th_low=50` Hamming threshold, and orientation histogram consistency check (30 bins, 3-maxima filtering).
-- `match_descriptors`: Generic brute-force Hamming matching with cross-check and Lowe's ratio test.
+- **Feature extraction:** ORB detector with scale pyramids, FAST-based keypoint detection, and binary descriptors
+- **Feature matching:** Hamming-based matching with ratio tests and orientation consistency
+- **Pose estimation:** Two-view geometry (fundamental/homography selection), EPnP with RANSAC, and triangulation
+- **Optimization:** A generic Levenberg–Marquardt solver with support for SE(3) manifolds and robust loss functions (Huber, Cauchy)
+- **Place recognition:** Bag-of-Words vocabulary tree with multiple similarity metrics and direct indexing
+- **Lie group operations:** Full SE(3), SO(3), and related transformations for geometric optimization
 
-**Pose Estimation (kornia-3d):**
-- `two_view_estimate`: Full pipeline - RANSAC fundamental (8pt, 2000 iterations, 1px threshold) + RANSAC homography → model selection (homography preferred when `inlier_count_H > 0.8 * inlier_count_F`) → essential decomposition → cheirality-checked triangulation.
-- `triangulate_point_linear`: DLT triangulation with depth and parallax validation.
-- EPnP solver with barycentric coordinates, multi-beta null-space estimation, optional LM refinement. RANSAC wrapper: 100 iterations, 8px threshold, adaptive iteration count, early stop at 95% inlier ratio, optional refit on all inliers.
-
-**Optimization (kornia-algebra):**
-- `LevenbergMarquardt`: Generic optimizer with `Problem`/`Factor`/`Variable` architecture. Supports SE3, SO3, SE2, SO2 variable types via `VariableType::plus()` manifold retraction. Lambda adaptation (init: 1e-3, max: 1e10, factor: 10x). Cost/gradient convergence checks. Callback support.
-- `ReprojectionFactor`: SE3 pose parameterization `[qw, qx, qy, qz, tx, ty, tz]`, numerical Jacobians (central differences), distortion support (Brown-Conrady polynomial).
-- Robust losses: `IdentityLoss`, `HuberLoss`, `CauchyLoss` - each with `weight()` and `rho()` methods for IRLS-style optimization.
-
-**Place Recognition (kornia-bow):**
-- Hierarchical vocabulary tree with variable branching factor. Direct index for feature-to-word mapping. 6 BoW scoring methods (L1, L2, chi-square, KL divergence, Bhattacharyya, dot product). Bincode serialization.
-
-**Lie Groups (kornia-algebra):**
-- SE3F32: `exp`/`log`, `retract`, `left_jacobian`/`right_jacobian`, `adjoint`, `inverse`. Full tangent-space operations.
-- SO3F32, Sim3F32, SE2F32, SO2F32 - complete Lie group stack.
-
-### 4.2 kornia-slam - Under Active Development
-
-The kornia-slam repository's `develop` branch already contains a working visual odometry pipeline with mapping and bundle adjustment. The maintainer is actively adding IMU preintegration, which will yield a visual-inertial odometry (VIO) backbone. The MVP branch is stale and should not be referenced.
-
-**This proposal does not build these components. It assumes they exist and makes them robust.**
-
-#### 4.2.1 Current Pipeline Capabilities (Develop Branch Analysis)
-
-Analysis of the develop branch (27 commits, 4 core modules + example pipeline) shows that the current system already implements:
-
-- **State machine:** `Bootstrap` → `Tracking` (two states; no explicit LOST state - after 15 consecutive failures, the system resets to Bootstrap while the map object persists but is effectively abandoned)
-- **Motion model:** Constant velocity prediction via `state.velocity` - the predicted pose is already used as the PnP initial guess
-- **Tracking pipeline:** Projection-guided matching → PnP with LM refinement → local map refinement, implemented in `MapProjectionEstimator`
-- **Guided matching:** Already implemented via map point projection + `KeypointGrid` spatial index (`query_radius()` with `search_radius=15px`, `max_hamming=50`), including a narrow-to-wide fallback (doubles radius if <20 matches), with descriptor matching fallback against the reference keyframe
-- **Map point management:** `MapPoint` tracks `n_visible`, `n_found`, and `found_ratio()`. `Map::cull()` removes points with `found_ratio < 0.20` after 5 observations, plus behind-camera culling
-- **Local bundle adjustment:** `Map::optimize()` runs on the last ~3 keyframes using `kornia_3d::ba::bundle_adjust`, fixing older keyframes as anchors
-- **Keyframe insertion:** `KeyframePolicy` based on frame gap (`min=3`, `max=8`) and inlier ratio threshold (`ref_ratio=0.6`)
-- **Map triangulation:** New map points are grown from keyframe pairs via two-view estimation + `triangulate_matched_points`
-- **Local map selection:** `build_local_map_points()` uses covisibility voting + recent keyframe neighborhood
-
-The robustness modules proposed here (Sections 5.1–5.5) build directly on this existing pipeline. Section 5.6 ensures alignment with the IMU integration being developed in parallel, and Section 5.7 introduces adaptive runtime monitoring on top of the complete system.
-
-#### 4.2.2 Identified Robustness Gaps
-
-Despite having a functional pipeline, several key robustness features are missing. These gaps define the scope of this proposal:
-
-| Gap | Current Behavior | Impact |
-|---|---|---|
-| **No preprocessing** | Raw images → ORB directly | Feature starvation in mixed lighting, descriptor corruption under motion blur |
-| **No adaptive feature extraction** | Fixed FAST thresholds (global two-tier) | Poor spatial coverage in low-contrast regions |
-| **No statistical outlier rejection** | Only RANSAC + reprojection threshold filtering | Bad correspondences from dynamic objects persist in the map |
-| **No relocalization** | 15 failures → reset to Bootstrap (map abandoned, bootstrap restarts from scratch) | Effective loss of mapping progress on any tracking interruption |
-| **No explicit LOST state** | Binary Bootstrap/Tracking | No opportunity to attempt recovery before destroying the map |
-| **No redundant keyframe culling** | Keyframes accumulate indefinitely | Memory growth, BA slowdown in long sessions |
-| **No adaptive parameter tuning** | All thresholds are compile-time constants | Silent degradation when conditions change mid-session |
-| **No robustness evaluation framework** | Example runs on EuRoC but no systematic benchmarking | No way to measure improvement or regression |
-
-### 4.3 Bubbaloop - Mature Runtime
-
-Bubbaloop provides the deployment target: Zenoh pub/sub data plane, Node SDK (~80-line template for self-describing nodes with automatic schema and health queryables, plus conventions for manifest/config/command), MCP server (40+ tools, 3-tier RBAC), multi-agent runtime with 4-tier memory (world state → short-term → episodic → semantic), and a React dashboard. Topics follow `bubbaloop/{scope}/{machine_id}/...` with node-specific subtopic hierarchies. The node SDK handles Zenoh session management, health heartbeats (5s interval), and schema registration automatically.
+These components collectively provide all the building blocks required for a modern visual SLAM pipeline.
 
 ---
 
+### 4.2 kornia-slam — Current Pipeline
+
+The `develop` branch of kornia-slam already implements a working visual odometry system with mapping and local bundle adjustment. IMU preintegration is being actively added by the maintainer, forming the basis of a visual-inertial pipeline.
+
+**This proposal does not aim to build these components. It assumes they exist and focuses on making them robust.**
+
+#### 4.2.1 Current Capabilities
+
+The current system includes:
+
+- **State machine:** Bootstrap → Tracking (no explicit LOST state)
+- **Motion model:** Constant velocity prediction used as PnP initialization
+- **Tracking pipeline:** Projection-guided matching → PnP → local refinement
+- **Guided matching:** Spatially constrained matching using projected map points with fallback strategies
+- **Map point management:** Visibility-based tracking and basic culling using observation ratios
+- **Local bundle adjustment:** Optimization over recent keyframes with older frames fixed
+- **Keyframe insertion:** Based on frame spacing and inlier ratios
+- **Map growth:** Triangulation from keyframe pairs
+- **Local map selection:** Covisibility-based neighborhood construction
+
+These components together form a functional SLAM pipeline capable of running on standard datasets.
+
+---
+
+### 4.2.2 Identified Robustness Gaps
+
+Despite having a complete pipeline, several critical robustness components are missing:
+
+| Gap | Current Behavior | Impact |
+|---|---|---|
+| **No preprocessing** | Raw images fed directly to ORB | Feature starvation under challenging lighting |
+| **No adaptive feature extraction** | Fixed FAST thresholds | Poor spatial coverage in low-contrast regions |
+| **No statistical outlier rejection** | Only RANSAC filtering | Dynamic or incorrect matches persist in map |
+| **No relocalization** | Tracking failure triggers reset | Loss of accumulated map and trajectory |
+| **No explicit LOST state** | Binary Bootstrap/Tracking | No recovery attempt before reset |
+| **No keyframe culling** | Keyframes grow unbounded | Increased memory and optimization cost |
+| **No adaptive tuning** | Fixed parameters | Silent degradation under changing conditions |
+| **No evaluation framework** | No systematic benchmarking | No measurable way to validate improvements |
+
+These gaps are not architectural limitations, but **missing robustness layers** on top of an already functional system.
+
+---
+
+### 4.3 Bubbaloop — Deployment Runtime
+
+Bubbaloop provides a mature runtime environment for deploying the SLAM system, including:
+
+- Zenoh-based pub/sub communication
+- Node SDK for modular system design
+- MCP server for tool-based interaction
+- Multi-agent runtime with structured memory layers
+- Web-based dashboard for visualization and monitoring
+
+This enables the SLAM system to operate as part of a larger agent-driven application, rather than as a standalone pipeline.
+
+---
 ## 5. Proposed Work
 
 All improvements build on top of the existing kornia-slam pipeline. Each subsection identifies a specific failure mode, the proposed fix, the concrete implementation, and how to verify it works. All thresholds and parameter values given below are initial heuristics derived from ORB-SLAM2/3 defaults and SLAM literature; they will be empirically tuned across datasets during evaluation.
@@ -223,6 +270,7 @@ fn detect_cell_adaptive(
 **Verification:** Run on TUM `fr3/nostructure_texture_near_withloop` (featureless surfaces interspersed with textured regions). Compare feature spatial distribution uniformity before/after.
 
 ### 5.2 Tracking Robustness
+![Alt text](images\tracking_pipeline.png)
 
 **Problem:** The current pipeline already includes projection-based matching (with `KeypointGrid` spatial index and narrow-to-wide search radius fallback), constant velocity motion prediction, and basic map point filtering via `found_ratio`. However, these components lack statistical outlier rejection, adaptive behavior under degraded conditions, and robustness to dynamic or low-quality observations. Specifically: there is no chi-square test after PnP to catch individual bad correspondences, no mechanism to detect and respond to prediction failures (e.g., scene changes), and the matching search radius is fixed rather than condition-aware.
 
@@ -304,6 +352,7 @@ The first keyframe (origin) and the two most recent keyframes are never culled.
 **Verification:** Run TUM `fr1/room` (360° loop, ~1500 frames). Compare keyframe count and BA time with/without culling. Target: significant keyframe reduction (~20–40% expected), proportional BA speedup, no ATE degradation.
 
 ### 5.4 Failure Recovery
+![Alt text](images\lost_state.png)
 
 **Problem:** When tracking fails, the current pipeline increments `consecutive_failures` and after 15 failures calls `state.reset()`, which transitions back to `Bootstrap` mode. While the `Map` object is not explicitly cleared, the system restarts bootstrapping from scratch with no mechanism to reconnect to the existing map. There is no LOST state, no relocalization attempt, and no way to recover the mapping progress. A momentary occlusion or fast head turn effectively abandons minutes of accumulated mapping work.
 
@@ -369,7 +418,7 @@ The maintainer is actively adding IMU preintegration to kornia-slam's develop br
 **Verification:** When IMU preintegration lands in develop, run the robustness test suite on TUM-VI sequences (which include synchronized IMU data) to confirm no regressions. Specifically, test that keyframe management (5.3) and relocalization (5.4) handle the tighter inter-keyframe constraints introduced by preintegration factors.
 
 ### 5.7 Adaptive Runtime Monitoring and Parameter Adjustment
-
+![Alt Text](images/adaptive_monitoring.png)
 **Problem:** Traditional SLAM systems use fixed parameters tuned for average conditions. When conditions change (entering a dark corridor, passing through a texture-less hallway, encountering fast motion), the fixed configuration degrades silently until tracking fails. A human operator must notice the failure and restart.
 
 **Concept:** Instead of fixed parameters, the SLAM pipeline exposes runtime observables and accepts runtime reconfiguration. A lightweight, deterministic monitor (rule-based, no ML) watches these observables and adjusts pipeline parameters in real-time. This design is compatible with future agent-based extensions via Bubbaloop's MCP tools.
@@ -690,28 +739,55 @@ All code follows kornia-rs conventions: safe Rust, `thiserror` errors, no `unsaf
 
 ### Contributions to Kornia
 
-- **Issue #3406** - Proposed and led SAM-3 integration strategy (inference-first staged approach)
-- **PR #3548** - Complete Phase 3 SAM-3 implementation with multi-mask support
-- **Refactoring PRs** - Moved NeRF utilities to `kornia.geometry.camera.utils`
+- **Issue #3406** — Proposed and led SAM-3 integration strategy (inference-first staged approach)
+- **PR #3548** — Implemented Phase 3 SAM-3 with multi-mask support
+- **Refactoring PRs** — Moved NeRF utilities to `kornia.geometry.camera.utils`
 
 ### Contributions to kornia-rs
 
-- **ORB test fixes** - Diagnosed and fixed failing ORB feature tests across the imgproc module
-- **Robust loss functions** - Added `IdentityLoss`, `HuberLoss`, `CauchyLoss` to the LM optimizer - the same losses now used in kornia-rs's optimization infrastructure
+- **ORB test fixes** — Diagnosed and resolved failing ORB feature tests across the imgproc module
+- **Robust loss functions** — Implemented `IdentityLoss`, `HuberLoss`, and `CauchyLoss` in the LM optimizer (now part of the optimization stack)
 
 ### Independent Project
 
-- **Rusty SLAM** (https://github.com/arc-wonders/rusty_slam) - Monocular visual odometry in Rust. This project taught me exactly where VO pipelines fail: my system drifts badly on sequences with fast rotation (ORB descriptors under blur), loses tracking in featureless corridors (fixed FAST threshold), and has no recovery mechanism. Every robustness improvement in this proposal addresses a failure I personally encountered and debugged.
+- **Rusty SLAM** — Monocular visual odometry in Rust  
+  https://github.com/arc-wonders/rusty_slam  
 
-### Why This Proposal
+This project exposed the exact failure modes targeted in this proposal:
+- tracking loss under motion blur  
+- instability in low-texture environments  
+- drift accumulation  
+- lack of recovery after failure  
 
-I am not proposing to build a SLAM system - I am proposing to make one work in the real world. My experience with rusty_slam gave me an intuitive understanding of each failure mode. My contributions to kornia-rs gave me familiarity with the exact code (ORB detector, LM optimizer, robust losses) that the improvements will build on. The adaptive monitoring concept - having the system observe its own health and adjust parameters - is a natural extension of the robustness work and compatible with Bubbaloop's agent-first architecture. And my systems-level approach - preferring working demos over isolated algorithms - aligns with the goal of published benchmarks, a video demo, and a live Bubbaloop application.
+Each robustness improvement proposed here directly addresses a failure I have personally encountered, debugged, and attempted to solve.
 
-This proposal focuses on the part of SLAM that determines whether it works outside controlled benchmarks: making it reliable enough to be used continuously, not just demonstrated.
+---
+
+### Why Me
+
+I am not proposing to build a SLAM system — I am proposing to make one reliable.
+
+My work on rusty_slam gave me practical experience with real-world failure modes.  
+My contributions to kornia and kornia-rs give me familiarity with the exact components this proposal builds on — including ORB extraction, matching, and optimization.
+
+I am already working in this codebase, not approaching it for the first time.
+
+The focus of this proposal — robustness, recovery, and system-level behavior — aligns with both my prior work and the direction of kornia-slam. The adaptive monitoring system further extends this into a controllable and observable pipeline, compatible with Bubbaloop’s agent-driven architecture.
+
+This is not an exploratory project for me.  
+It is a continuation of work I have already started.
+
+The goal is simple:  
+to make kornia-slam stable enough to run continuously in real-world conditions, not just on curated benchmarks.
+
+---
 
 ## 12. Pre-GSoC Contributions Plan
 
 I will begin contributing immediately to:
-- Integrating CLAHE into kornia-imgproc
-- Adding evaluation scripts for TUM/EuRoC benchmarks
-- Improving documentation around the tracking pipeline
+
+- Integrating CLAHE into kornia-imgproc as a reusable preprocessing module
+- Building a reproducible benchmark pipeline for TUM and EuRoC (ATE + tracking success rate)
+- Improving documentation and clarity around the existing tracking pipeline
+
+These contributions will establish familiarity with the evolving develop branch and provide baseline metrics for evaluating the proposed improvements.
